@@ -1,17 +1,14 @@
 import os
 import re
-import time
 import requests
 from flask import Flask, request, jsonify
-from datetime import datetime
 
 app = Flask(__name__)
 
 # ---------------- ENV ----------------
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-SHOPIFY_SHOP_NAME = os.getenv("SHOPIFY_SHOP_NAME")
 
+# Slack channels where "ST.order #1234" may appear
 CHANNELS_TO_SEARCH = [
     "C0A02M2VCTB",  # order
     "C0A068PHZMY"   # shopify-slack
@@ -26,18 +23,12 @@ order_tracking = {}
 def is_new_order_message(text, order_number):
     if not text:
         return False
-
-    text = text.lower().strip()
-    blacklist = ["fulfilled", "tracking", "report", "generated", "payment"]
-    if any(word in text for word in blacklist):
-        return False
-
-    match = re.search(r"\bst\.order\s+#?(\d+)\b", text)
+    match = re.search(r"\bst\.order\s+#?(\d+)\b", text.lower())
     return bool(match and match.group(1) == order_number)
 
 
 # --------------------------------------------------
-# 🔍 FIND NEW ORDER MESSAGE
+# 🔍 FIND ORIGINAL NEW ORDER SLACK MESSAGE
 # --------------------------------------------------
 def find_new_order_message(order_number):
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
@@ -62,96 +53,40 @@ def find_new_order_message(order_number):
 
 
 # --------------------------------------------------
-# 🔁 RETRY SLACK SEARCH (60s WAIT)
+# 😀 ADD EMOJI REACTION
 # --------------------------------------------------
-def find_slack_message_with_retry(order_number, retries=6, delay=10):
-    for attempt in range(retries):
-        ts, channel = find_new_order_message(order_number)
-        if ts:
-            return ts, channel
-        print(f"⏳ Waiting for Slack message... attempt {attempt + 1}")
-        time.sleep(delay)
-    return None, None
-
-
-# --------------------------------------------------
-# 📤 POST THREAD MESSAGE
-# --------------------------------------------------
-def post_thread_message(channel, thread_ts, text):
+def add_reaction(channel, message_ts, emoji_name):
     resp = requests.post(
-        "https://slack.com/api/chat.postMessage",
+        "https://slack.com/api/reactions.add",
         headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
         json={
             "channel": channel,
-            "thread_ts": thread_ts,
-            "text": text
-        },
-        timeout=10
-    )
-    return resp.json().get("ok", False)
-
-
-# --------------------------------------------------
-# 🏷️ MESSAGE BUILDERS
-# --------------------------------------------------
-def payment_message(status):
-    return {
-        "pending": "⏳ Payment Pending",
-        "authorized": "🔒 Payment Authorized",
-        "paid": "✅ Payment Paid",
-        "voided": "❌ Payment Voided"
-    }.get(status, f"💳 Payment {status}")
-
-
-def fulfillment_message(status):
-    return {
-        "fulfilled": "🚀 Fulfilled",
-        "unfulfilled": "📭 Unfulfilled"
-    }.get(status, f"📦 {status}")
-
-
-def stock_message(status):
-    if status.lower() == "stock available":
-        return "📦 Stock Available"
-    return f"📦 Stock Status: {status}"
-
-
-# --------------------------------------------------
-# 📦 FETCH STOCK STATUS (ORDER METAFIELD)
-# --------------------------------------------------
-def fetch_stock_status(order_id):
-    url = f"https://{SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/2025-01/graphql.json"
-
-    query = """
-    query ($id: ID!) {
-      order(id: $id) {
-        metafield(namespace: "custom", key: "stock_status") {
-          value
-        }
-      }
-    }
-    """
-
-    resp = requests.post(
-        url,
-        headers={
-            "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
-            "Content-Type": "application/json"
-        },
-        json={
-            "query": query,
-            "variables": {"id": f"gid://shopify/Order/{order_id}"}
+            "timestamp": message_ts,
+            "name": emoji_name   # emoji name WITHOUT :
         },
         timeout=10
     )
 
-    return (
-        resp.json()
-        .get("data", {})
-        .get("order", {})
-        .get("metafield", {})
-        .get("value")
-    )
+    print("⬅️ Slack reaction response:", resp.json())
+
+
+# --------------------------------------------------
+# 🏷️ EMOJI MAPPINGS
+# --------------------------------------------------
+def payment_reaction(status):
+    return {
+        "pending": "hourglass_flowing_sand",
+        "authorized": "lock",
+        "paid": "white_check_mark",
+        "voided": "x"
+    }.get(status)
+
+
+def fulfillment_reaction(status):
+    return {
+        "unfulfilled": "mailbox_with_no_mail",
+        "fulfilled": "rocket"
+    }.get(status)
 
 
 # --------------------------------------------------
@@ -166,12 +101,9 @@ def shopify_webhook():
     if not order_number:
         return jsonify({"error": "order number missing"}), 400
 
-    # Detect metafield-only update
-    is_metafield_update = bool(order.get("metafields"))
-
-    # Find Slack message (with retry on creation)
+    # Find Slack message once per order
     if order_number not in order_tracking:
-        ts, channel = find_slack_message_with_retry(order_number)
+        ts, channel = find_new_order_message(order_number)
         if not ts:
             return jsonify({"ok": False}), 202
 
@@ -179,49 +111,26 @@ def shopify_webhook():
             "ts": ts,
             "channel": channel,
             "payment": None,
-            "fulfillment": None,
-            "stock": None
+            "fulfillment": None
         }
 
     track = order_tracking[order_number]
-    time_now = datetime.now().strftime("%I:%M %p")
 
-    # -------- PAYMENT --------
-    payment_status = order.get("financial_status")
-    if payment_status and payment_status != track["payment"]:
-        if payment_status == "pending" or not is_metafield_update:
-            if post_thread_message(
-                track["channel"],
-                track["ts"],
-                f"{payment_message(payment_status)} • {time_now}"
-            ):
-                track["payment"] = payment_status
+    # -------- PAYMENT STATUS --------
+    payment = order.get("financial_status")
+    if payment and payment != track["payment"]:
+        emoji = payment_reaction(payment)
+        if emoji:
+            add_reaction(track["channel"], track["ts"], emoji)
+        track["payment"] = payment
 
-    # -------- FULFILLMENT --------
-    fulfillment_status = order.get("fulfillment_status")
-    if fulfillment_status and fulfillment_status != track["fulfillment"]:
-        if not is_metafield_update:
-            if post_thread_message(
-                track["channel"],
-                track["ts"],
-                f"{fulfillment_message(fulfillment_status)} • {time_now}"
-            ):
-                track["fulfillment"] = fulfillment_status
-
-    # -------- STOCK STATUS (SAFE – NO CRASH) --------
-    try:
-        stock_status = fetch_stock_status(order.get("id"))
-    except Exception as e:
-        print("❌ Stock fetch failed:", e)
-        stock_status = None
-
-    if stock_status and stock_status != track["stock"]:
-        if post_thread_message(
-            track["channel"],
-            track["ts"],
-            f"{stock_message(stock_status)} • {time_now}"
-        ):
-            track["stock"] = stock_status
+    # -------- FULFILLMENT STATUS --------
+    fulfillment = order.get("fulfillment_status")
+    if fulfillment and fulfillment != track["fulfillment"]:
+        emoji = fulfillment_reaction(fulfillment)
+        if emoji:
+            add_reaction(track["channel"], track["ts"], emoji)
+        track["fulfillment"] = fulfillment
 
     return jsonify({"ok": True}), 200
 
