@@ -62,7 +62,7 @@ def find_new_order_message(order_number):
 
 
 # --------------------------------------------------
-# 🔁 RETRY SLACK SEARCH (FIXED: 60s TOTAL WAIT)
+# 🔁 RETRY SLACK SEARCH (60s WAIT)
 # --------------------------------------------------
 def find_slack_message_with_retry(order_number, retries=6, delay=10):
     for attempt in range(retries):
@@ -208,8 +208,13 @@ def shopify_webhook():
             ):
                 track["fulfillment"] = fulfillment_status
 
-    # -------- STOCK STATUS --------
-    stock_status = fetch_stock_status(order.get("id"))
+    # -------- STOCK STATUS (SAFE – NO CRASH) --------
+    try:
+        stock_status = fetch_stock_status(order.get("id"))
+    except Exception as e:
+        print("❌ Stock fetch failed:", e)
+        stock_status = None
+
     if stock_status and stock_status != track["stock"]:
         if post_thread_message(
             track["channel"],
