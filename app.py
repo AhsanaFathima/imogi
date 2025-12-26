@@ -62,13 +62,14 @@ def find_new_order_message(order_number):
 
 
 # --------------------------------------------------
-# 🔁 RETRY SLACK SEARCH (for pending on creation)
+# 🔁 RETRY SLACK SEARCH (FIXED: 60s TOTAL WAIT)
 # --------------------------------------------------
-def find_slack_message_with_retry(order_number, retries=3, delay=5):
+def find_slack_message_with_retry(order_number, retries=6, delay=10):
     for attempt in range(retries):
         ts, channel = find_new_order_message(order_number)
         if ts:
             return ts, channel
+        print(f"⏳ Waiting for Slack message... attempt {attempt + 1}")
         time.sleep(delay)
     return None, None
 
@@ -168,7 +169,7 @@ def shopify_webhook():
     # Detect metafield-only update
     is_metafield_update = bool(order.get("metafields"))
 
-    # Find Slack message (retry for first creation)
+    # Find Slack message (with retry on creation)
     if order_number not in order_tracking:
         ts, channel = find_slack_message_with_retry(order_number)
         if not ts:
