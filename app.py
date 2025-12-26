@@ -6,20 +6,23 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # ---------------- ENV ----------------
+# These values MUST exist in Render Environment Variables
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 SHOPIFY_SHOP_NAME = os.getenv("SHOPIFY_SHOP_NAME")
 
+# Slack channels where "New Order" message may appear
 CHANNELS_TO_SEARCH = [
     "C0A02M2VCTB",  # order
     "C0A068PHZMY"   # shopify-slack
 ]
 
-# Prevent duplicate reactions
+# In-memory store to avoid duplicate reactions
+# NOTE: This resets if app restarts
 order_tracking = {}
 
 # --------------------------------------------------
-# 🔒 STRICT MATCH: ONLY "ST.order #1234"
+# 🔒 STRICT MATCH: ONLY messages like "ST.order #1234"
 # --------------------------------------------------
 def is_new_order_message(text, order_number):
     if not text:
@@ -29,9 +32,11 @@ def is_new_order_message(text, order_number):
 
 
 # --------------------------------------------------
-# 🔍 FIND ORIGINAL NEW ORDER MESSAGE
+# 🔍 FIND ORIGINAL "NEW ORDER" SLACK MESSAGE
 # --------------------------------------------------
 def find_new_order_message(order_number):
+    print("🔍 Searching Slack message for order:", order_number)
+
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
 
     for channel in CHANNELS_TO_SEARCH:
@@ -44,36 +49,41 @@ def find_new_order_message(order_number):
 
         data = resp.json()
         if not data.get("ok"):
+            print("❌ Slack history fetch failed for channel:", channel)
             continue
 
         for msg in reversed(data.get("messages", [])):
             if is_new_order_message(msg.get("text", ""), order_number):
+                print("✅ Found Slack message in channel:", channel)
                 return msg["ts"], channel
 
+    print("❌ New order Slack message NOT found")
     return None, None
 
 
 # --------------------------------------------------
-# 😀 ADD EMOJI REACTION
+# 😀 ADD EMOJI REACTION TO SLACK MESSAGE
 # --------------------------------------------------
 def add_reaction(channel, message_ts, emoji_name):
+    print(f"😀 Adding emoji reaction: :{emoji_name}:")
+
     resp = requests.post(
         "https://slack.com/api/reactions.add",
         headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
         json={
             "channel": channel,
             "timestamp": message_ts,
-            "name": emoji_name   # no colons
+            "name": emoji_name  # emoji name WITHOUT :
         },
         timeout=10
     )
 
+    # Log Slack API response (very important for debugging)
     print("⬅️ Slack response:", resp.json())
 
-    
 
 # --------------------------------------------------
-# 🏷️ EMOJI MAPPINGS (FINAL)
+# 🏷️ EMOJI MAPPINGS
 # --------------------------------------------------
 def payment_reaction(status):
     return {
@@ -98,9 +108,11 @@ def stock_reaction(status):
 
 
 # --------------------------------------------------
-# 📦 FETCH STOCK STATUS (ORDER METAFIELD)
+# 📦 FETCH STOCK STATUS FROM SHOPIFY (ORDER METAFIELD)
 # --------------------------------------------------
 def fetch_stock_status(order_id):
+    print("📦 Fetching stock status for order:", order_id)
+
     url = f"https://{SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/2025-01/graphql.json"
 
     query = """
@@ -126,7 +138,7 @@ def fetch_stock_status(order_id):
         timeout=10
     )
 
-    return (
+    value = (
         resp.json()
         .get("data", {})
         .get("order", {})
@@ -134,20 +146,28 @@ def fetch_stock_status(order_id):
         .get("value")
     )
 
+    print("📦 Stock status value:", value)
+    return value
+
 
 # --------------------------------------------------
-# 🛒 SHOPIFY WEBHOOK
+# 🛒 SHOPIFY WEBHOOK ENTRY POINT
 # --------------------------------------------------
 @app.route("/webhook/shopify", methods=["POST"])
 def shopify_webhook():
+    print("📩 Shopify webhook received")
+
     data = request.get_json(force=True)
     order = data.get("order", data)
+
+    print("🧾 Order ID:", order.get("id"))
+    print("🧾 Order Name:", order.get("name"))
 
     order_number = str(order.get("name", "")).replace("#", "").strip()
     if not order_number:
         return jsonify({"error": "order number missing"}), 400
 
-    # Cache Slack message reference
+    # Step 1: Find Slack message only once per order
     if order_number not in order_tracking:
         ts, channel = find_new_order_message(order_number)
         if not ts:
@@ -163,25 +183,28 @@ def shopify_webhook():
 
     track = order_tracking[order_number]
 
-    # -------- PAYMENT REACTION --------
+    # -------- PAYMENT STATUS --------
     payment = order.get("financial_status")
     if payment and payment != track["payment"]:
+        print("💳 Payment status changed:", payment)
         emoji = payment_reaction(payment)
         if emoji:
             add_reaction(track["channel"], track["ts"], emoji)
         track["payment"] = payment
 
-    # -------- FULFILLMENT REACTION --------
+    # -------- FULFILLMENT STATUS --------
     fulfillment = order.get("fulfillment_status")
     if fulfillment and fulfillment != track["fulfillment"]:
+        print("🚚 Fulfillment status changed:", fulfillment)
         emoji = fulfillment_reaction(fulfillment)
         if emoji:
             add_reaction(track["channel"], track["ts"], emoji)
         track["fulfillment"] = fulfillment
 
-    # -------- STOCK REACTION --------
+    # -------- STOCK STATUS --------
     stock = fetch_stock_status(order.get("id"))
     if stock and stock != track["stock"]:
+        print("📦 Stock status changed:", stock)
         emoji = stock_reaction(stock)
         if emoji:
             add_reaction(track["channel"], track["ts"], emoji)
@@ -191,7 +214,7 @@ def shopify_webhook():
 
 
 # --------------------------------------------------
-# 🧪 HEALTH CHECK
+# 🧪 HEALTH CHECK ENDPOINT
 # --------------------------------------------------
 @app.route("/health")
 def health():
@@ -201,6 +224,8 @@ def health():
     })
 
 
+# --------------------------------------------------
+# LOCAL RUN (Render uses Gunicorn instead)
 # --------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
